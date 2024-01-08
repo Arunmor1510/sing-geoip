@@ -237,7 +237,6 @@ func release(source string, destination string, output string, ruleSetOutput str
 		return err
 	}
 
-	os.RemoveAll(ruleSetOutput)
 	err = os.MkdirAll(ruleSetOutput, 0o755)
 	if err != nil {
 		return err
@@ -319,7 +318,6 @@ func releaseContinent(source string, destination string, output string, ruleSetO
 		return err
 	}
 
-	os.RemoveAll(ruleSetOutput)
 	err = os.MkdirAll(ruleSetOutput, 0o755)
 	if err != nil {
 		return err
