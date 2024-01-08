@@ -86,6 +86,9 @@ func parse(binary []byte) (metadata maxminddb.Metadata, countryMap map[string][]
 		var code string
 		if country.Country.IsoCode != "" {
 			code = strings.ToLower(country.Country.IsoCode)
+			if country.Continent.Code == "EU" {
+				countryMap["eu"] = append(countryMap["eu"], ipNet)
+			}
 		} else if country.RegisteredCountry.IsoCode != "" {
 			code = strings.ToLower(country.RegisteredCountry.IsoCode)
 		} else if country.RepresentedCountry.IsoCode != "" {
@@ -172,7 +175,7 @@ func release(source string, destination string, output string, ruleSetOutput str
 	if err != nil {
 		log.Warn("missing destination latest release")
 	} else {
-		if os.Getenv("NO_SKIP") != "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
+		if os.Getenv("NO_SKIP") == "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
 			log.Info("already latest")
 			setActionOutput("skip", "true")
 			return nil
