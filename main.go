@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/sagernet/sing-box/common/geosite"
 	"github.com/sagernet/sing-box/common/srs"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -18,11 +20,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 
 	"github.com/google/go-github/v45/github"
-	"github.com/maxmind/mmdbwriter"
-	"github.com/maxmind/mmdbwriter/inserter"
-	"github.com/maxmind/mmdbwriter/mmdbtype"
-	"github.com/oschwald/geoip2-golang"
-	"github.com/oschwald/maxminddb-golang"
+	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
+	"google.golang.org/protobuf/proto"
 )
 
 var githubClient *github.Client
@@ -59,194 +58,277 @@ func get(downloadURL *string) ([]byte, error) {
 }
 
 func download(release *github.RepositoryRelease) ([]byte, error) {
-	geoipAsset := common.Find(release.Assets, func(it *github.ReleaseAsset) bool {
-		return *it.Name == "Country.mmdb"
+	geositeAsset := common.Find(release.Assets, func(it *github.ReleaseAsset) bool {
+		return *it.Name == "geosite.dat"
 	})
-	if geoipAsset == nil {
-		return nil, E.New("Country.mmdb not found in upstream release ", release.Name)
-	}
-	return get(geoipAsset.BrowserDownloadURL)
-}
-
-func parse(binary []byte) (metadata maxminddb.Metadata, countryMap map[string][]*net.IPNet, err error) {
-	database, err := maxminddb.FromBytes(binary)
-	if err != nil {
-		return
-	}
-	metadata = database.Metadata
-	networks := database.Networks(maxminddb.SkipAliasedNetworks)
-	countryMap = make(map[string][]*net.IPNet)
-	var country geoip2.Enterprise
-	var ipNet *net.IPNet
-	for networks.Next() {
-		ipNet, err = networks.Network(&country)
-		if err != nil {
-			return
-		}
-		var code string
-		if country.Country.IsoCode != "" {
-			code = strings.ToLower(country.Country.IsoCode)
-		} else if country.RegisteredCountry.IsoCode != "" {
-			code = strings.ToLower(country.RegisteredCountry.IsoCode)
-		} else if country.RepresentedCountry.IsoCode != "" {
-			code = strings.ToLower(country.RepresentedCountry.IsoCode)
-		} else if country.Continent.Code != "" {
-			code = strings.ToLower(country.Continent.Code)
-		} else {
-			continue
-		}
-		countryMap[code] = append(countryMap[code], ipNet)
-	}
-	err = networks.Err()
-	return
-}
-
-func parseContinent(binary []byte) (metadata maxminddb.Metadata, countryMap map[string][]*net.IPNet, err error) {
-	database, err := maxminddb.FromBytes(binary)
-	if err != nil {
-		return
-	}
-	metadata = database.Metadata
-	networks := database.Networks(maxminddb.SkipAliasedNetworks)
-	countryMap = make(map[string][]*net.IPNet)
-	var country geoip2.Enterprise
-	var ipNet *net.IPNet
-	for networks.Next() {
-		ipNet, err = networks.Network(&country)
-		if err != nil {
-			return
-		}
-		var code string
-		if country.Continent.Code != "" {
-			code = strings.ToLower(country.Continent.Names["en"])
-			code = strings.ReplaceAll(code, " ", "")
-		} else {
-			continue
-		}
-		countryMap[code] = append(countryMap[code], ipNet)
-	}
-	err = networks.Err()
-	return
-}
-
-func newWriter(metadata maxminddb.Metadata, codes []string) (*mmdbwriter.Tree, error) {
-	return mmdbwriter.New(mmdbwriter.Options{
-		DatabaseType:            "sing-geoip",
-		Languages:               codes,
-		IPVersion:               int(metadata.IPVersion),
-		RecordSize:              int(metadata.RecordSize),
-		Inserter:                inserter.ReplaceWith,
-		DisableIPv4Aliasing:     true,
-		IncludeReservedNetworks: true,
+	geositeChecksumAsset := common.Find(release.Assets, func(it *github.ReleaseAsset) bool {
+		return *it.Name == "geosite.dat.sha256sum"
 	})
-}
-
-func open(path string, codes []string) (*mmdbwriter.Tree, error) {
-	reader, err := maxminddb.Open(path)
+	if geositeAsset == nil {
+		return nil, E.New("geosite asset not found in upstream release ", release.Name)
+	}
+	if geositeChecksumAsset == nil {
+		return nil, E.New("geosite asset not found in upstream release ", release.Name)
+	}
+	data, err := get(geositeAsset.BrowserDownloadURL)
 	if err != nil {
 		return nil, err
 	}
-	if reader.Metadata.DatabaseType != "sing-geoip" {
-		return nil, E.New("invalid sing-geoip database")
+	remoteChecksum, err := get(geositeChecksumAsset.BrowserDownloadURL)
+	if err != nil {
+		return nil, err
 	}
-	reader.Close()
-
-	return mmdbwriter.Load(path, mmdbwriter.Options{
-		Languages: append(reader.Metadata.Languages, common.Filter(codes, func(it string) bool {
-			return !common.Contains(reader.Metadata.Languages, it)
-		})...),
-		Inserter: inserter.ReplaceWith,
-	})
+	checksum := sha256.Sum256(data)
+	if hex.EncodeToString(checksum[:]) != string(remoteChecksum[:64]) {
+		return nil, E.New("checksum mismatch")
+	}
+	return data, nil
 }
 
-func write(writer *mmdbwriter.Tree, dataMap map[string][]*net.IPNet, output string, codes []string) error {
-	if len(codes) == 0 {
-		codes = make([]string, 0, len(dataMap))
-		for code := range dataMap {
-			codes = append(codes, code)
-		}
+func parse(vGeositeData []byte) (map[string][]geosite.Item, error) {
+	vGeositeList := routercommon.GeoSiteList{}
+	err := proto.Unmarshal(vGeositeData, &vGeositeList)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(codes)
-	codeMap := make(map[string]bool)
-	for _, code := range codes {
-		codeMap[code] = true
-	}
-	for code, data := range dataMap {
-		if !codeMap[code] {
-			continue
-		}
-		for _, item := range data {
-			err := writer.Insert(item, mmdbtype.String(code))
-			if err != nil {
-				return err
+	domainMap := make(map[string][]geosite.Item)
+	for _, vGeositeEntry := range vGeositeList.Entry {
+		code := strings.ToLower(vGeositeEntry.CountryCode)
+		domains := make([]geosite.Item, 0, len(vGeositeEntry.Domain)*2)
+		attributes := make(map[string][]*routercommon.Domain)
+		for _, domain := range vGeositeEntry.Domain {
+			if len(domain.Attribute) > 0 {
+				for _, attribute := range domain.Attribute {
+					attributes[attribute.Key] = append(attributes[attribute.Key], domain)
+				}
+			}
+			switch domain.Type {
+			case routercommon.Domain_Plain:
+				domains = append(domains, geosite.Item{
+					Type:  geosite.RuleTypeDomainKeyword,
+					Value: domain.Value,
+				})
+			case routercommon.Domain_Regex:
+				domains = append(domains, geosite.Item{
+					Type:  geosite.RuleTypeDomainRegex,
+					Value: domain.Value,
+				})
+			case routercommon.Domain_RootDomain:
+				if strings.Contains(domain.Value, ".") {
+					domains = append(domains, geosite.Item{
+						Type:  geosite.RuleTypeDomain,
+						Value: domain.Value,
+					})
+				}
+				domains = append(domains, geosite.Item{
+					Type:  geosite.RuleTypeDomainSuffix,
+					Value: "." + domain.Value,
+				})
+			case routercommon.Domain_Full:
+				domains = append(domains, geosite.Item{
+					Type:  geosite.RuleTypeDomain,
+					Value: domain.Value,
+				})
 			}
 		}
+		domainMap[code] = common.Uniq(domains)
+		for attribute, attributeEntries := range attributes {
+			attributeDomains := make([]geosite.Item, 0, len(attributeEntries)*2)
+			for _, domain := range attributeEntries {
+				switch domain.Type {
+				case routercommon.Domain_Plain:
+					attributeDomains = append(attributeDomains, geosite.Item{
+						Type:  geosite.RuleTypeDomainKeyword,
+						Value: domain.Value,
+					})
+				case routercommon.Domain_Regex:
+					attributeDomains = append(attributeDomains, geosite.Item{
+						Type:  geosite.RuleTypeDomainRegex,
+						Value: domain.Value,
+					})
+				case routercommon.Domain_RootDomain:
+					if strings.Contains(domain.Value, ".") {
+						attributeDomains = append(attributeDomains, geosite.Item{
+							Type:  geosite.RuleTypeDomain,
+							Value: domain.Value,
+						})
+					}
+					attributeDomains = append(attributeDomains, geosite.Item{
+						Type:  geosite.RuleTypeDomainSuffix,
+						Value: "." + domain.Value,
+					})
+				case routercommon.Domain_Full:
+					attributeDomains = append(attributeDomains, geosite.Item{
+						Type:  geosite.RuleTypeDomain,
+						Value: domain.Value,
+					})
+				}
+			}
+			domainMap[code+"@"+attribute] = common.Uniq(attributeDomains)
+		}
 	}
+	return domainMap, nil
+}
+
+type filteredCodePair struct {
+	code    string
+	badCode string
+}
+
+func filterTags(data map[string][]geosite.Item) {
+	var codeList []string
+	for code := range data {
+		codeList = append(codeList, code)
+	}
+	var badCodeList []filteredCodePair
+	var filteredCodeMap []string
+	var mergedCodeMap []string
+	for _, code := range codeList {
+		codeParts := strings.Split(code, "@")
+		if len(codeParts) != 2 {
+			continue
+		}
+		leftParts := strings.Split(codeParts[0], "-")
+		var lastName string
+		if len(leftParts) > 1 {
+			lastName = leftParts[len(leftParts)-1]
+		}
+		if lastName == "" {
+			lastName = codeParts[0]
+		}
+		if lastName == codeParts[1] {
+			delete(data, code)
+			filteredCodeMap = append(filteredCodeMap, code)
+			continue
+		}
+		if "!"+lastName == codeParts[1] {
+			badCodeList = append(badCodeList, filteredCodePair{
+				code:    codeParts[0],
+				badCode: code,
+			})
+		} else if lastName == "!"+codeParts[1] {
+			badCodeList = append(badCodeList, filteredCodePair{
+				code:    codeParts[0],
+				badCode: code,
+			})
+		}
+	}
+	for _, it := range badCodeList {
+		badList := data[it.badCode]
+		if badList == nil {
+			panic("bad list not found: " + it.badCode)
+		}
+		delete(data, it.badCode)
+		newMap := make(map[geosite.Item]bool)
+		for _, item := range data[it.code] {
+			newMap[item] = true
+		}
+		for _, item := range badList {
+			delete(newMap, item)
+		}
+		newList := make([]geosite.Item, 0, len(newMap))
+		for item := range newMap {
+			newList = append(newList, item)
+		}
+		data[it.code] = newList
+		mergedCodeMap = append(mergedCodeMap, it.badCode)
+	}
+	sort.Strings(filteredCodeMap)
+	sort.Strings(mergedCodeMap)
+	os.Stderr.WriteString("filtered " + strings.Join(filteredCodeMap, ",") + "\n")
+	os.Stderr.WriteString("merged " + strings.Join(mergedCodeMap, ",") + "\n")
+}
+
+func mergeTags(data map[string][]geosite.Item) {
+	var codeList []string
+	for code := range data {
+		codeList = append(codeList, code)
+	}
+	var cnCodeList []string
+	for _, code := range codeList {
+		codeParts := strings.Split(code, "@")
+		if len(codeParts) != 2 {
+			continue
+		}
+		if codeParts[1] != "cn" {
+			continue
+		}
+		if !strings.HasPrefix(codeParts[0], "category-") {
+			continue
+		}
+		if strings.HasSuffix(codeParts[0], "-cn") || strings.HasSuffix(codeParts[0], "-!cn") {
+			continue
+		}
+		cnCodeList = append(cnCodeList, code)
+	}
+	newMap := make(map[geosite.Item]bool)
+	for _, item := range data["cn"] {
+		newMap[item] = true
+	}
+	for _, code := range cnCodeList {
+		for _, item := range data[code] {
+			newMap[item] = true
+		}
+	}
+	newList := make([]geosite.Item, 0, len(newMap))
+	for item := range newMap {
+		newList = append(newList, item)
+	}
+	data["cn"] = newList
+	println("merged cn categories: " + strings.Join(cnCodeList, ","))
+}
+
+func generate(release *github.RepositoryRelease, output string, cnOutput string, ruleSetOutput string) error {
+	vData, err := download(release)
+	if err != nil {
+		return err
+	}
+	domainMap, err := parse(vData)
+	if err != nil {
+		return err
+	}
+	filterTags(domainMap)
+	mergeTags(domainMap)
+	outputPath, _ := filepath.Abs(output)
+	os.Stderr.WriteString("write " + outputPath + "\n")
 	outputFile, err := os.Create(output)
 	if err != nil {
 		return err
 	}
 	defer outputFile.Close()
-	_, err = writer.WriteTo(outputFile)
-	return err
-}
-
-func release(source string, destination string, output string, ruleSetOutput string) error {
-	sourceRelease, err := fetch(source)
+	err = geosite.Write(outputFile, domainMap)
 	if err != nil {
 		return err
 	}
-	destinationRelease, err := fetch(destination)
-	if err != nil {
-		log.Warn("missing destination latest release")
-	} else {
-		if os.Getenv("NO_SKIP") != "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
-			log.Info("already latest")
-			setActionOutput("skip", "true")
-			return nil
-		}
+	cnCodes := []string{
+		"cn",
+		"geolocation-!cn",
 	}
-	binary, err := download(sourceRelease)
+	cnDomainMap := make(map[string][]geosite.Item)
+	for _, cnCode := range cnCodes {
+		cnDomainMap[cnCode] = domainMap[cnCode]
+	}
+	cnOutputFile, err := os.Create(cnOutput)
 	if err != nil {
 		return err
 	}
-	metadata, countryMap, err := parse(binary)
+	defer cnOutputFile.Close()
+	err = geosite.Write(cnOutputFile, cnDomainMap)
 	if err != nil {
 		return err
 	}
-	allCodes := make([]string, 0, len(countryMap))
-	for code := range countryMap {
-		allCodes = append(allCodes, code)
-	}
-
-	writer, err := newWriter(metadata, allCodes)
-	if err != nil {
-		return err
-	}
-	err = write(writer, countryMap, output, nil)
-	if err != nil {
-		return err
-	}
-
-	writer, err = newWriter(metadata, []string{"cn"})
-	if err != nil {
-		return err
-	}
-	err = write(writer, countryMap, "geoip-cn.db", []string{"cn"})
-	if err != nil {
-		return err
-	}
-
+	os.RemoveAll(ruleSetOutput)
 	err = os.MkdirAll(ruleSetOutput, 0o755)
 	if err != nil {
 		return err
 	}
-	for countryCode, ipNets := range countryMap {
+	for code, domains := range domainMap {
 		var headlessRule option.DefaultHeadlessRule
-		headlessRule.IPCIDR = make([]string, 0, len(ipNets))
-		for _, cidr := range ipNets {
-			headlessRule.IPCIDR = append(headlessRule.IPCIDR, cidr.String())
-		}
+		defaultRule := geosite.Compile(domains)
+		headlessRule.Domain = defaultRule.Domain
+		headlessRule.DomainSuffix = defaultRule.DomainSuffix
+		headlessRule.DomainKeyword = defaultRule.DomainKeyword
+		headlessRule.DomainRegex = defaultRule.DomainRegex
 		var plainRuleSet option.PlainRuleSet
 		plainRuleSet.Rules = []option.HeadlessRule{
 			{
@@ -254,8 +336,8 @@ func release(source string, destination string, output string, ruleSetOutput str
 				DefaultOptions: headlessRule,
 			},
 		}
-		srsPath, _ := filepath.Abs(filepath.Join(ruleSetOutput, "geoip-"+countryCode+".srs"))
-		os.Stderr.WriteString("write " + srsPath + "\n")
+		srsPath, _ := filepath.Abs(filepath.Join(ruleSetOutput, "geosite-"+code+".srs"))
+		//os.Stderr.WriteString("write " + srsPath + "\n")
 		outputRuleSet, err := os.Create(srsPath)
 		if err != nil {
 			return err
@@ -267,12 +349,11 @@ func release(source string, destination string, output string, ruleSetOutput str
 		}
 		outputRuleSet.Close()
 	}
-
-	setActionOutput("tag", *sourceRelease.Name)
 	return nil
 }
 
-func releaseContinent(source string, destination string, output string, ruleSetOutput string) error {
+
+func release(source string, destination string, output string, cnOutput string, ruleSetOutput string) error {
 	sourceRelease, err := fetch(source)
 	if err != nil {
 		return err
@@ -283,89 +364,25 @@ func releaseContinent(source string, destination string, output string, ruleSetO
 	} else {
 		if os.Getenv("NO_SKIP") != "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
 			log.Info("already latest")
-			setActionOutput("skip", "true")
 			return nil
 		}
 	}
-	binary, err := download(sourceRelease)
+	err = generate(sourceRelease, output, cnOutput, ruleSetOutput)
 	if err != nil {
 		return err
 	}
-	metadata, countryMap, err := parseContinent(binary)
-	if err != nil {
-		return err
-	}
-	allCodes := make([]string, 0, len(countryMap))
-	for code := range countryMap {
-		allCodes = append(allCodes, code)
-	}
-
-	writer, err := newWriter(metadata, allCodes)
-	if err != nil {
-		return err
-	}
-	err = write(writer, countryMap, output, nil)
-	if err != nil {
-		return err
-	}
-
-	writer, err = newWriter(metadata, []string{"cn"})
-	if err != nil {
-		return err
-	}
-	err = write(writer, countryMap, "geoip-cn.db", []string{"cn"})
-	if err != nil {
-		return err
-	}
-
-	err = os.MkdirAll(ruleSetOutput, 0o755)
-	if err != nil {
-		return err
-	}
-	for countryCode, ipNets := range countryMap {
-		var headlessRule option.DefaultHeadlessRule
-		headlessRule.IPCIDR = make([]string, 0, len(ipNets))
-		for _, cidr := range ipNets {
-			headlessRule.IPCIDR = append(headlessRule.IPCIDR, cidr.String())
-		}
-		var plainRuleSet option.PlainRuleSet
-		plainRuleSet.Rules = []option.HeadlessRule{
-			{
-				Type:           C.RuleTypeDefault,
-				DefaultOptions: headlessRule,
-			},
-		}
-		srsPath, _ := filepath.Abs(filepath.Join(ruleSetOutput, "geoip-"+countryCode+".srs"))
-		os.Stderr.WriteString("write " + srsPath + "\n")
-		outputRuleSet, err := os.Create(srsPath)
-		if err != nil {
-			return err
-		}
-		err = srs.Write(outputRuleSet, plainRuleSet)
-		if err != nil {
-			outputRuleSet.Close()
-			return err
-		}
-		outputRuleSet.Close()
-	}
-
-	setActionOutput("tag", *sourceRelease.Name)
 	return nil
-}
-
-func setActionOutput(name string, content string) {
-	os.Stdout.WriteString("::set-output name=" + name + "::" + content + "\n")
 }
 
 func main() {
-	
-	err := releaseContinent("Dreamacro/maxmind-geoip", "Arunmor1510/sing-geoip", "geoip.db", "rule-set")
+	err := release(
+		"Loyalsoldier/v2ray-rules-dat",
+		"Arunmor1510/sing-geoip",
+		"geosite.db",
+		"geosite-cn.db",
+		"rule-set",
+	)
 	if err != nil {
-		log.Fatal(err)
-	}
-	
-	err2 := release("soffchen/geoip", "Arunmor1510/sing-geoip", "geoip.db", "rule-set")
-	if err2 != nil {
 		log.Fatal(err)
 	}
 }
