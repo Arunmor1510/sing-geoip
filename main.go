@@ -364,7 +364,7 @@ func main() {
 		log.Fatal(err)
 	}
 	
-	err2 := release("Loyalsoldier/geoip", "Arunmor1510/sing-geoip", "geoip.db", "rule-set")
+	err2 := release("soffchen/geoip", "Arunmor1510/sing-geoip", "geoip.db", "rule-set")
 	if err2 != nil {
 		log.Fatal(err)
 	}
