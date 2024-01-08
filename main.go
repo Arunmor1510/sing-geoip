@@ -86,15 +86,40 @@ func parse(binary []byte) (metadata maxminddb.Metadata, countryMap map[string][]
 		var code string
 		if country.Country.IsoCode != "" {
 			code = strings.ToLower(country.Country.IsoCode)
-			if country.Continent.Code == "EU" {
-				countryMap["eu"] = append(countryMap["eu"], ipNet)
-			}
 		} else if country.RegisteredCountry.IsoCode != "" {
 			code = strings.ToLower(country.RegisteredCountry.IsoCode)
 		} else if country.RepresentedCountry.IsoCode != "" {
 			code = strings.ToLower(country.RepresentedCountry.IsoCode)
 		} else if country.Continent.Code != "" {
 			code = strings.ToLower(country.Continent.Code)
+		} else {
+			continue
+		}
+		countryMap[code] = append(countryMap[code], ipNet)
+	}
+	err = networks.Err()
+	return
+}
+
+func parseContinent(binary []byte) (metadata maxminddb.Metadata, countryMap map[string][]*net.IPNet, err error) {
+	database, err := maxminddb.FromBytes(binary)
+	if err != nil {
+		return
+	}
+	metadata = database.Metadata
+	networks := database.Networks(maxminddb.SkipAliasedNetworks)
+	countryMap = make(map[string][]*net.IPNet)
+	var country geoip2.Enterprise
+	var ipNet *net.IPNet
+	for networks.Next() {
+		ipNet, err = networks.Network(&country)
+		if err != nil {
+			return
+		}
+		var code string
+		if country.Continent.Code != "" {
+			code = strings.ToLower(country.Continent.Names["en"])
+			code = strings.ReplaceAll(code, " ", "")
 		} else {
 			continue
 		}
@@ -175,7 +200,7 @@ func release(source string, destination string, output string, ruleSetOutput str
 	if err != nil {
 		log.Warn("missing destination latest release")
 	} else {
-		if os.Getenv("NO_SKIP") == "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
+		if os.Getenv("NO_SKIP") != "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
 			log.Info("already latest")
 			setActionOutput("skip", "true")
 			return nil
@@ -248,13 +273,101 @@ func release(source string, destination string, output string, ruleSetOutput str
 	return nil
 }
 
+func releaseContinent(source string, destination string, output string, ruleSetOutput string) error {
+	sourceRelease, err := fetch(source)
+	if err != nil {
+		return err
+	}
+	destinationRelease, err := fetch(destination)
+	if err != nil {
+		log.Warn("missing destination latest release")
+	} else {
+		if os.Getenv("NO_SKIP") != "true" && strings.Contains(*destinationRelease.Name, *sourceRelease.Name) {
+			log.Info("already latest")
+			setActionOutput("skip", "true")
+			return nil
+		}
+	}
+	binary, err := download(sourceRelease)
+	if err != nil {
+		return err
+	}
+	metadata, countryMap, err := parseContinent(binary)
+	if err != nil {
+		return err
+	}
+	allCodes := make([]string, 0, len(countryMap))
+	for code := range countryMap {
+		allCodes = append(allCodes, code)
+	}
+
+	writer, err := newWriter(metadata, allCodes)
+	if err != nil {
+		return err
+	}
+	err = write(writer, countryMap, output, nil)
+	if err != nil {
+		return err
+	}
+
+	writer, err = newWriter(metadata, []string{"cn"})
+	if err != nil {
+		return err
+	}
+	err = write(writer, countryMap, "geoip-cn.db", []string{"cn"})
+	if err != nil {
+		return err
+	}
+
+	os.RemoveAll(ruleSetOutput)
+	err = os.MkdirAll(ruleSetOutput, 0o755)
+	if err != nil {
+		return err
+	}
+	for countryCode, ipNets := range countryMap {
+		var headlessRule option.DefaultHeadlessRule
+		headlessRule.IPCIDR = make([]string, 0, len(ipNets))
+		for _, cidr := range ipNets {
+			headlessRule.IPCIDR = append(headlessRule.IPCIDR, cidr.String())
+		}
+		var plainRuleSet option.PlainRuleSet
+		plainRuleSet.Rules = []option.HeadlessRule{
+			{
+				Type:           C.RuleTypeDefault,
+				DefaultOptions: headlessRule,
+			},
+		}
+		srsPath, _ := filepath.Abs(filepath.Join(ruleSetOutput, "geoip-"+countryCode+".srs"))
+		os.Stderr.WriteString("write " + srsPath + "\n")
+		outputRuleSet, err := os.Create(srsPath)
+		if err != nil {
+			return err
+		}
+		err = srs.Write(outputRuleSet, plainRuleSet)
+		if err != nil {
+			outputRuleSet.Close()
+			return err
+		}
+		outputRuleSet.Close()
+	}
+
+	setActionOutput("tag", *sourceRelease.Name)
+	return nil
+}
+
 func setActionOutput(name string, content string) {
 	os.Stdout.WriteString("::set-output name=" + name + "::" + content + "\n")
 }
 
 func main() {
-	err := release("Dreamacro/maxmind-geoip", "sagernet/sing-geoip", "geoip.db", "rule-set")
+	
+	err := releaseContinent("Dreamacro/maxmind-geoip", "Arunmor1510/sing-geoip", "geoip.db", "rule-set")
 	if err != nil {
+		log.Fatal(err)
+	}
+	
+	err2 := release("Loyalsoldier/geoip", "Arunmor1510/sing-geoip", "geoip.db", "rule-set")
+	if err2 != nil {
 		log.Fatal(err)
 	}
 }
